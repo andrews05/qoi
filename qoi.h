@@ -84,23 +84,25 @@ Pixels are encoded as
 The color channels are assumed to not be premultiplied with the alpha channel
 ("un-premultiplied alpha").
 
-A running array[64] (zero-initialized) of previously seen pixel values is
-maintained by the encoder and decoder. Each pixel that is seen by the encoder
-and decoder is put into this array at the position formed by a hash function of
-the color value. In the encoder, if the pixel value at the index matches the
-current pixel, this index position is written to the stream as QOI_OP_INDEX.
-The hash function for the index is:
-
-	index_position = (r * 3 + g * 5 + b * 7 + a * 11) % 64
-
-Each chunk starts with a 2- or 8-bit tag, followed by a number of data bits. The
-bit length of chunks is divisible by 8 - i.e. all chunks are byte aligned. All
+Each chunk starts with a 2- or 8-bit tag, followed by a number of data bits. The 
+bit length of chunks is divisible by 8 - i.e. all chunks are byte aligned. All 
 values encoded in these data bits have the most significant bit on the left.
 
 The 8-bit tags have precedence over the 2-bit tags. A decoder must check for the
 presence of an 8-bit tag first.
 
 The byte stream's end is marked with 7 0x00 bytes followed a single 0x01 byte.
+
+A running FIFO array[64] (zero-initialized) of pixel values is maintained by the
+encoder and decoder. Every pixel en-/decoded by the QOI_OP_DIFF, QOI_OP_LUMA, 
+QOI_OP_RGB and QOI_OP_RGBA chunks is written to this array. The write position
+starts at 0 and is incremented with each pixel written. The position wraps back
+to 0 when it reaches 64. I.e:
+	index[index_pos % 64] = current_pixel;
+	index_pos = index_pos + 1;
+
+An encoder can search this array for the current pixel value and, if a match is
+found, emit a QOI_OP_INDEX with the position within the array.
 
 
 The possible chunks are:
@@ -319,11 +321,15 @@ Implementation */
 
 #define QOI_MASK_2    0xc0 /* 11000000 */
 
-#define QOI_COLOR_HASH(C) (C.rgba.r*3 + C.rgba.g*5 + C.rgba.b*7 + C.rgba.a*11)
 #define QOI_MAGIC \
 	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
 	 ((unsigned int)'i') <<  8 | ((unsigned int)'f'))
 #define QOI_HEADER_SIZE 14
+
+/* To not have to linearly search through the color index array, we use a hash 
+of the color value to quickly lookup the index position in a hash table. */
+#define QOI_COLOR_HASH(C) (C.rgba.r*3 + C.rgba.g*5 + C.rgba.b*7 + C.rgba.a*11)
+#define QOI_COLOR_HASH_SIZE 1024
 
 /* 2GB is the max file size that this implementation can safely handle. We guard
 against anything larger than that, assuming the worst case with 5 bytes per
@@ -358,6 +364,8 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	int px_len, px_end, px_pos, channels;
 	unsigned char *bytes;
 	const unsigned char *pixels;
+	unsigned int index_lookup[QOI_COLOR_HASH_SIZE];
+	unsigned int index_pos = 0;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
 
@@ -371,9 +379,9 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 		return NULL;
 	}
 
-	max_size =
-		desc->width * desc->height * (desc->channels + 1) +
-		QOI_HEADER_SIZE + sizeof(qoi_padding);
+	max_size = 
+		desc->width * desc->height * (desc->channels + 1) + 
+		QOI_HEADER_SIZE + (int)sizeof(qoi_padding);
 
 	p = 0;
 	bytes = (unsigned char *) QOI_MALLOC(max_size);
@@ -391,6 +399,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	pixels = (const unsigned char *)data;
 
 	QOI_ZEROARR(index);
+	QOI_ZEROARR(index_lookup);
 
 	run = 0;
 	px_prev.rgba.r = 0;
@@ -420,20 +429,19 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 			}
 		}
 		else {
-			int index_pos;
+			int hash = QOI_COLOR_HASH(px) % QOI_COLOR_HASH_SIZE;
 
 			if (run > 0) {
 				bytes[p++] = QOI_OP_RUN | (run - 1);
 				run = 0;
 			}
 
-			index_pos = QOI_COLOR_HASH(px) % 64;
-
-			if (index[index_pos].v == px.v) {
-				bytes[p++] = QOI_OP_INDEX | index_pos;
+			if (index[index_lookup[hash] % 64].v == px.v) {
+				bytes[p++] = QOI_OP_INDEX | (index_lookup[hash] % 64);
 			}
 			else {
-				index[index_pos] = px;
+				index_lookup[hash] = index_pos;
+				index[index_pos++ % 64] = px;
 
 				if (px.rgba.a == px_prev.rgba.a) {
 					signed char vr = px.rgba.r - px_prev.rgba.r;
@@ -493,6 +501,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	qoi_rgba_t px;
 	int px_len, chunks_len, px_pos;
 	int p = 0, run = 0;
+	int index_pos = 0;
 
 	if (
 		data == NULL || desc == NULL ||
@@ -548,12 +557,14 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 				px.rgba.r = bytes[p++];
 				px.rgba.g = bytes[p++];
 				px.rgba.b = bytes[p++];
+				index[index_pos++ % 64] = px;
 			}
 			else if (b1 == QOI_OP_RGBA) {
 				px.rgba.r = bytes[p++];
 				px.rgba.g = bytes[p++];
 				px.rgba.b = bytes[p++];
 				px.rgba.a = bytes[p++];
+				index[index_pos++ % 64] = px;
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
 				px = index[b1];
@@ -562,6 +573,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
 				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
 				px.rgba.b += ( b1       & 0x03) - 2;
+				index[index_pos++ % 64] = px;
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
 				int b2 = bytes[p++];
@@ -569,12 +581,11 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
 				px.rgba.g += vg;
 				px.rgba.b += vg - 8 +  (b2       & 0x0f);
+				index[index_pos++ % 64] = px;
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
 				run = (b1 & 0x3f);
 			}
-
-			index[QOI_COLOR_HASH(px) % 64] = px;
 		}
 
 		pixels[px_pos + 0] = px.rgba.r;
