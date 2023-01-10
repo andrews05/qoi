@@ -311,11 +311,11 @@ Implementation */
 #endif
 
 #define QOI_OP_INDEX  0x00 /* 00xxxxxx */
-#define QOI_OP_DIFF   0x40 /* 01xxxxxx */
-#define QOI_OP_LUMA   0x80 /* 10xxxxxx */
-#define QOI_OP_ALUMA  0xc0 /* 110xxxxx */
+#define QOI_OP_LUMA2  0x40 /* 01xxxxxx */
+#define QOI_OP_LUMA3  0x80 /* 10xxxxxx */
+#define QOI_OP_ALPHA  0xc0 /* 110xxxxx */
 #define QOI_OP_RUN    0xe0 /* 1110xxxx */
-#define QOI_OP_LRUN   0xf0 /* 1111xxxx */
+#define QOI_OP_RUN2   0xf0 /* 1111xxxx */
 #define QOI_OP_RGB    0xfe /* 11111110 */
 #define QOI_OP_RGBA   0xff /* 11111111 */
 
@@ -420,7 +420,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 			run++;
 			if (run == 0x0e00 || px_pos == px_end) {
 				run--;
-				bytes[p++] = QOI_OP_LRUN | run >> 8;
+				bytes[p++] = QOI_OP_RUN2 | run >> 8;
 				bytes[p++] = run & 0xff;
 				run = 0;
 			}
@@ -430,7 +430,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 			if (run > 16) {
 				run--;
-				bytes[p++] = QOI_OP_LRUN | run >> 8;
+				bytes[p++] = QOI_OP_RUN2 | run >> 8;
 				bytes[p++] = run & 0xff;
 				run = 0;
 			} else if (run > 0) {
@@ -456,30 +456,31 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 				signed char vg_b = vb - vg;
 
 				if (
-					vr > -3 && vr < 2 &&
-					vg > -3 && vg < 2 &&
-					vb > -3 && vb < 2 &&
-					va == 0
-				) {
-					bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
-				}
-				else if (
 					vg_r >  -9 && vg_r <  8 &&
 					vg   > -33 && vg   < 32 &&
 					vg_b >  -9 && vg_b <  8 &&
 					va == 0
 				) {
-					bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
+					bytes[p++] = QOI_OP_LUMA2    | (vg   + 32);
 					bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
 				}
 				else if (
-					vg_r >  -9 && vg_r <  8 &&
-					vg_b >  -9 && vg_b <  8 &&
-					va   > -17 && va   < 16
+					vg_r > -65 && vg_r < 64 &&
+					vg_b > -65 && vg_b < 64 &&
+					va == 0
 				) {
-					bytes[p++] = QOI_OP_ALUMA    | (va   + 16);
-					bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+					bytes[p++] = QOI_OP_LUMA3     | (vg_r + 64) >> 1;
+					bytes[p++] = (vg_r + 64) << 7 | (vg_b + 64);
 					bytes[p++] = vg;
+				}
+				else if (
+					vg_r >  -9 && vg_r <  8 &&
+					vg   > -17 && vg   < 16 &&
+					vg_b >  -9 && vg_b <  8
+				) {
+					bytes[p++] = QOI_OP_ALPHA    | (vg   + 16);
+					bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+					bytes[p++] = px.rgba.a;
 				}
 				else if (va == 0) {
 					bytes[p++] = QOI_OP_RGB;
@@ -582,13 +583,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
 				px = index[b1];
 			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
-				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
-				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
-				px.rgba.b += ( b1       & 0x03) - 2;
-				index[QOI_COLOR_HASH(px) % 64] = px;
-			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
+			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA2) {
 				int b2 = bytes[p++];
 				int vg = (b1 & 0x3f) - 32;
 				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
@@ -596,20 +591,27 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 				px.rgba.b += vg - 8 +  (b2       & 0x0f);
 				index[QOI_COLOR_HASH(px) % 64] = px;
 			}
-			else if ((b1 & QOI_MASK_3) == QOI_OP_ALUMA) {
+			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA3) {
 				int b2 = bytes[p++];
 				int vg = bytes[p++];
-				int va = (b1 & 0x1f) - 16;
+				px.rgba.r += vg - 64 + ((b1 & 0x3f) << 1 | (b2 >> 7));
+				px.rgba.g += vg;
+				px.rgba.b += vg - 64 +  (b2 & 0x7f);
+				index[QOI_COLOR_HASH(px) % 64] = px;
+			}
+			else if ((b1 & QOI_MASK_3) == QOI_OP_ALPHA) {
+				int b2 = bytes[p++];
+				int vg = (b1 & 0x1f) - 16;
 				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
 				px.rgba.g += vg;
 				px.rgba.b += vg - 8 +  (b2       & 0x0f);
-				px.rgba.a += va;
+				px.rgba.a = bytes[p++];
 				index[QOI_COLOR_HASH(px) % 64] = px;
 			}
 			else if ((b1 & QOI_MASK_4) == QOI_OP_RUN) {
 				run = (b1 & 0x0f);
 			}
-			else { // QOI_OP_LRUN
+			else { // QOI_OP_RUN2
 				run = (b1 & 0x0f) << 8 | bytes[p++];
 			}
 
