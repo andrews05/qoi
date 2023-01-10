@@ -1,16 +1,12 @@
 /*
 
-Copyright (c) 2021, Dominic Szablewski - https://phoboslab.org
+Copyright (c) 2021, Dominic Szablewski - https://phoboslab.org (original QOI format)
 SPDX-License-Identifier: MIT
 
 
-QOI - The "Quite OK Image" format for fast, lossless image compression
+QOI2 - Lossless image format inspired by QOI “Quite OK Image” format
 
--- About
-
-QOI encodes and decodes images in a lossless format. Compared to stb_image and
-stb_image_write QOI offers 20x-50x faster encoding, 3x-4x faster decoding and
-20% better compression.
+Incompatible adaptation of QOI format
 
 
 -- Synopsis
@@ -64,7 +60,7 @@ A QOI file has a 14 byte header, followed by any number of data "chunks" and an
 8-byte end marker.
 
 struct qoi_header_t {
-	char     magic[4];   // magic bytes "qoif"
+	char     magic[4];   // magic bytes "qoi2"
 	uint32_t width;      // image width in pixels (BE)
 	uint32_t height;     // image height in pixels (BE)
 	uint8_t  channels;   // 3 = RGB, 4 = RGBA
@@ -79,23 +75,20 @@ Pixels are encoded as
  - a run of the previous pixel
  - an index into an array of previously seen pixels
  - a difference to the previous pixel value in r,g,b
- - full r,g,b or r,g,b,a values
+ - full r,g,b or a or gray values
 
 The color channels are assumed to not be premultiplied with the alpha channel
 ("un-premultiplied alpha").
 
-Each chunk starts with a 2- or 8-bit tag, followed by a number of data bits. The 
-bit length of chunks is divisible by 8 - i.e. all chunks are byte aligned. All 
-values encoded in these data bits have the most significant bit on the left.
+Each chunk starts with a tag, followed by a number of data bits. The bit length
+of chunks is divisible by 8 - i.e. all chunks are byte aligned. All values
+encoded in these data bits have the most significant bit on the left.
 
-The 8-bit tags have precedence over the 2-bit tags. A decoder must check for the
-presence of an 8-bit tag first.
-
-The byte stream's end is marked with 7 0x00 bytes followed a single 0x01 byte.
+The byte stream's end is marked with 4 0xff bytes.
 
 A running FIFO array[64] (zero-initialized) of pixel values is maintained by the
-encoder and decoder. Every pixel en-/decoded by the QOI_OP_DIFF, QOI_OP_LUMA, 
-QOI_OP_RGB and QOI_OP_RGBA chunks is written to this array. The write position
+encoder and decoder. Every pixel en-/decoded by the QOI_OP_LUMA (and variants),
+QOI_OP_GRAY and QOI_OP_RGB chunks is written to this array. The write position
 starts at 0 and is incremented with each pixel written. The position wraps back
 to 0 when it reaches 64. I.e:
 	index[index_pos % 64] = current_pixel;
@@ -112,100 +105,147 @@ The possible chunks are:
 |         Byte[0]         |
 |  7  6  5  4  3  2  1  0 |
 |-------+-----------------|
-|  0  0 |     index       |
+|  1  0 |     index       |
 `-------------------------`
-2-bit tag b00
+2-bit tag b10
 6-bit index into the color index array: 0..63
 
-A valid encoder must not issue 2 or more consecutive QOI_OP_INDEX chunks to the
-same index. QOI_OP_RUN should be used instead.
 
-
-.- QOI_OP_DIFF -----------.
+.- QOI_OP_LUMA -----------.
 |         Byte[0]         |
 |  7  6  5  4  3  2  1  0 |
-|-------+-----+-----+-----|
-|  0  1 |  dr |  dg |  db |
+|----+--------+-----+-----|
+|  0 | g diff | drg | dbg |
 `-------------------------`
-2-bit tag b01
-2-bit   red channel difference from the previous pixel between -2..1
-2-bit green channel difference from the previous pixel between -2..1
-2-bit  blue channel difference from the previous pixel between -2..1
+1-bit tag b0
+3-bit green channel difference from the previous pixel -4..3
+2-bit   red channel difference minus green channel difference -1..2 or -2..1
+2-bit  blue channel difference minus green channel difference -1..2 or -2..1
 
-The difference to the current channel values are using a wraparound operation,
+The green channel is used to indicate the general direction of change and is
+encoded in 3 bits. The red and green channels (dr and db) base their diffs off
+of the green channel difference and are encoded in 2 bits. I.e.:
+	dr_dg = (last_px.r - cur_px.r) - (last_px.g - cur_px.g)
+	db_dg = (last_px.b - cur_px.b) - (last_px.g - cur_px.g)
+
+The difference to the current channel values are using a wraparound operation, 
 so "1 - 2" will result in 255, while "255 + 1" will result in 0.
 
-Values are stored as unsigned integers with a bias of 2. E.g. -2 is stored as
-0 (b00). 1 is stored as 3 (b11).
+Values are stored as unsigned integers with a bias of 4 for the green channel
+and a bias of 1 or 2 for the red and blue channel depending on the direction
+(sign bit) of the green channel.
 
-The alpha value remains unchanged from the previous pixel.
 
-
-.- QOI_OP_LUMA -------------------------------------.
+.- QOI_OP_LUMA2 ------------------------------------.
 |         Byte[0]         |         Byte[1]         |
 |  7  6  5  4  3  2  1  0 |  7  6  5  4  3  2  1  0 |
-|-------+-----------------+-------------+-----------|
-|  1  0 |  green diff     |   dr - dg   |  db - dg  |
+|----------+--------------+-------------+-----------|
+|  1  1  0 |  green diff  |   dr - dg   |  db - dg  |
 `---------------------------------------------------`
-2-bit tag b10
-6-bit green channel difference from the previous pixel -32..31
+3-bit tag b110
+5-bit green channel difference from the previous pixel -16..15
 4-bit   red channel difference minus green channel difference -8..7
 4-bit  blue channel difference minus green channel difference -8..7
 
-The green channel is used to indicate the general direction of change and is
-encoded in 6 bits. The red and blue channels (dr and db) base their diffs off
-of the green channel difference and are encoded in 4 bits. I.e.:
-	dr_dg = (cur_px.r - prev_px.r) - (cur_px.g - prev_px.g)
-	db_dg = (cur_px.b - prev_px.b) - (cur_px.g - prev_px.g)
+The green channel is used to indicate the general direction of change and is 
+encoded in 5 bits. The red and green channels (dr and db) base their diffs off
+of the green channel difference and are encoded in 4 bits.
 
-The difference to the current channel values are using a wraparound operation,
-so "10 - 13" will result in 253, while "250 + 7" will result in 1.
-
-Values are stored as unsigned integers with a bias of 32 for the green channel
+Values are stored as unsigned integers with a bias of 16 for the green channel
 and a bias of 8 for the red and blue channel.
 
 The alpha value remains unchanged from the previous pixel.
 
 
+.- QOI_OP_LUMA3 ------------------------------------.-------------------------.
+|         Byte[0]         |         Byte[1]         |         Byte[2]         |
+|  7  6  5  4  3  2  1  0 |  7  6  5  4  3  2  1  0 |  7  6  5  4  3  2  1  0 |
+|-------------+-----------+-------+-----------------+-------------------------|
+|  1  1  1  0 |      dr - dg      |     db - dg     |        green diff       |
+`-----------------------------------------------------------------------------`
+4-bit tag b1110
+6-bit   red channel difference minus green channel difference -32..31
+6-bit  blue channel difference minus green channel difference -32..31
+8-bit green channel difference from the previous pixel -128..127
+
+The green channel is used to indicate the general direction of change and is
+encoded in 8 bits. The red and green channels (dr and db) base their diffs off
+of the green channel difference and are encoded in 6 bits.
+
+Values are stored as unsigned integers with a bias of 128 for the green channel
+and a bias of 32 for the red and blue channel.
+
+
 .- QOI_OP_RUN ------------.
 |         Byte[0]         |
 |  7  6  5  4  3  2  1  0 |
-|-------+-----------------|
-|  1  1 |       run       |
+|----------------+--------|
+|  1  1  1  1  0 |  run   |
 `-------------------------`
-2-bit tag b11
-6-bit run-length repeating the previous pixel: 1..62
+5-bit tag b11110
+3-bit run-length repeating the previous pixel: 1..8
 
-The run-length is stored with a bias of -1. Note that the run-lengths 63 and 64
-(b111110 and b111111) are illegal as they are occupied by the QOI_OP_RGB and
-QOI_OP_RGBA tags.
+The run-length is stored with a bias of 1.
+
+
+.- QOI_OP_RUN2 ---------------------.
+|         Byte[0]         | Byte[1] |
+|  7  6  5  4  3  2  1  0 | 7 .. 0  |
+|-------------------+-----+---------|
+|  1  1  1  1  1  0 |      run      |
+`-----------------------------------`
+6-bit tag b111110
+10-bit run-length repeating the previous pixel: 1..1024
+
+The run-length is stored with a bias of 1.
+
+
+.- QOI_OP_GRAY ---------------------.
+|         Byte[0]         | Byte[1] |
+|  7  6  5  4  3  2  1  0 | 7 .. 0  |
+|-------------------------+---------|
+|  1  1  1  1  1  1  0  0 |  gray   |
+`-----------------------------------`
+8-bit tag b11111100
+8-bit gray channel value
 
 
 .- QOI_OP_RGB ------------------------------------------.
 |         Byte[0]         | Byte[1] | Byte[2] | Byte[3] |
 |  7  6  5  4  3  2  1  0 | 7 .. 0  | 7 .. 0  | 7 .. 0  |
 |-------------------------+---------+---------+---------|
-|  1  1  1  1  1  1  1  0 |   red   |  green  |  blue   |
+|  1  1  1  1  1  1  0  1 |   red   |  green  |  blue   |
 `-------------------------------------------------------`
+8-bit tag b11111101
+8-bit   red channel value
+8-bit green channel value
+8-bit  blue channel value
+
+
+.- QOI_OP_A ------------------------.
+|         Byte[0]         | Byte[1] |
+|  7  6  5  4  3  2  1  0 | 7 .. 0  |
+|-------------------------+---------|
+|  1  1  1  1  1  1  1  0 |  alpha  |
+`-----------------------------------`
 8-bit tag b11111110
-8-bit   red channel value
-8-bit green channel value
-8-bit  blue channel value
-
-The alpha value remains unchanged from the previous pixel.
-
-
-.- QOI_OP_RGBA ---------------------------------------------------.
-|         Byte[0]         | Byte[1] | Byte[2] | Byte[3] | Byte[4] |
-|  7  6  5  4  3  2  1  0 | 7 .. 0  | 7 .. 0  | 7 .. 0  | 7 .. 0  |
-|-------------------------+---------+---------+---------+---------|
-|  1  1  1  1  1  1  1  1 |   red   |  green  |  blue   |  alpha  |
-`-----------------------------------------------------------------`
-8-bit tag b11111111
-8-bit   red channel value
-8-bit green channel value
-8-bit  blue channel value
 8-bit alpha channel value
+
+
+.- QOI_OP_END ------------.
+|         Byte[0]         |
+|  7  6  5  4  3  2  1  0 |
+|-------------------------|
+|  1  1  1  1  1  1  1  1 |
+`-------------------------`
+8-bit tag b11111111
+
+
+The byte stream is padded at the end with four 0xff bytes. Since the longest
+legal chunk is 4 bytes (QOI_OP_RGB), with this padding it is possible to check
+for an overrun only once per decode loop iteration. These 0xff bytes also mark
+the end of the data stream, as an encoder should never produce four consecutive
+0xff bytes within the stream.
 
 */
 
@@ -312,37 +352,38 @@ Implementation */
 	#define QOI_ZEROARR(a) memset((a),0,sizeof(a))
 #endif
 
-#define QOI_OP_INDEX  0x00 /* 00xxxxxx */
-#define QOI_OP_DIFF   0x40 /* 01xxxxxx */
-#define QOI_OP_LUMA   0x80 /* 10xxxxxx */
-#define QOI_OP_RUN    0xc0 /* 11xxxxxx */
-#define QOI_OP_RGB    0xfe /* 11111110 */
-#define QOI_OP_RGBA   0xff /* 11111111 */
-
-#define QOI_MASK_2    0xc0 /* 11000000 */
+#define QOI_OP_LUMA   0x00 /* 0xxxxxxx */
+#define QOI_OP_INDEX  0x80 /* 10xxxxxx */
+#define QOI_OP_LUMA2  0xc0 /* 110xxxxx */
+#define QOI_OP_LUMA3  0xe0 /* 1110xxxx */
+#define QOI_OP_RUN    0xf0 /* 11110xxx */
+#define QOI_OP_RUN2   0xf8 /* 111110xx */
+#define QOI_OP_GRAY   0xfc /* 11111100 */
+#define QOI_OP_RGB    0xfd /* 11111101 */
+#define QOI_OP_A      0xfe /* 11111110 */
+#define QOI_OP_END    0xff /* 11111111 */
 
 #define QOI_MAGIC \
 	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
-	 ((unsigned int)'i') <<  8 | ((unsigned int)'f'))
+	 ((unsigned int)'i') <<  8 | ((unsigned int)'2'))
 #define QOI_HEADER_SIZE 14
 
 /* To not have to linearly search through the color index array, we use a hash 
 of the color value to quickly lookup the index position in a hash table. */
-#define QOI_COLOR_HASH(C) (C.rgba.r*3 + C.rgba.g*5 + C.rgba.b*7 + C.rgba.a*11)
-#define QOI_COLOR_HASH_SIZE 1024
+#define QOI_COLOR_HASH(C) (((C.v * 2654435769) >> 22) & 1023)
 
 /* 2GB is the max file size that this implementation can safely handle. We guard
-against anything larger than that, assuming the worst case with 5 bytes per
-pixel, rounded down to a nice clean value. 400 million pixels ought to be
+against anything larger than that, assuming the worst case with 6 bytes per
+pixel, rounded down to a nice clean value. 350 million pixels ought to be
 enough for anybody. */
-#define QOI_PIXELS_MAX ((unsigned int)400000000)
+#define QOI_PIXELS_MAX ((unsigned int)350000000)
 
 typedef union {
 	struct { unsigned char r, g, b, a; } rgba;
 	unsigned int v;
 } qoi_rgba_t;
 
-static const unsigned char qoi_padding[8] = {0,0,0,0,0,0,0,1};
+static const unsigned char qoi_padding[4] = {0xff,0xff,0xff,0xff};
 
 static void qoi_write_32(unsigned char *bytes, int *p, unsigned int v) {
 	bytes[(*p)++] = (0xff000000 & v) >> 24;
@@ -364,7 +405,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	int px_len, px_end, px_pos, channels;
 	unsigned char *bytes;
 	const unsigned char *pixels;
-	unsigned int index_lookup[QOI_COLOR_HASH_SIZE];
+	unsigned char index_lookup[1024];
 	unsigned int index_pos = 0;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
@@ -379,9 +420,16 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 		return NULL;
 	}
 
-	max_size = 
-		desc->width * desc->height * (desc->channels + 1) + 
-		QOI_HEADER_SIZE + (int)sizeof(qoi_padding);
+	if (desc->channels == 3) {
+		max_size = 
+			desc->width * desc->height * 4 + 
+			QOI_HEADER_SIZE + (int)sizeof(qoi_padding);
+	}
+	else {
+		max_size = 
+			desc->width * desc->height * 6 + 
+			QOI_HEADER_SIZE + (int)sizeof(qoi_padding);
+	}
 
 	p = 0;
 	bytes = (unsigned char *) QOI_MALLOC(max_size);
@@ -394,7 +442,6 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	qoi_write_32(bytes, &p, desc->height);
 	bytes[p++] = desc->channels;
 	bytes[p++] = desc->colorspace;
-
 
 	pixels = (const unsigned char *)data;
 
@@ -423,16 +470,25 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 		if (px.v == px_prev.v) {
 			run++;
-			if (run == 62 || px_pos == px_end) {
-				bytes[p++] = QOI_OP_RUN | (run - 1);
+			if (run == 1024 || px_pos == px_end) {
+				run--;
+				bytes[p++] = QOI_OP_RUN2 | ((run >> 8) & 3);
+				bytes[p++] = run & 0xff;
 				run = 0;
 			}
 		}
 		else {
-			int hash = QOI_COLOR_HASH(px) % QOI_COLOR_HASH_SIZE;
+			int hash = QOI_COLOR_HASH(px);
 
 			if (run > 0) {
-				bytes[p++] = QOI_OP_RUN | (run - 1);
+				run--;
+				if (run < 8) {
+					bytes[p++] = QOI_OP_RUN | run;
+				}
+				else {
+					bytes[p++] = QOI_OP_RUN2 | ((run >> 8) & 3);
+					bytes[p++] = run & 0xff;
+				}
 				run = 0;
 			}
 
@@ -442,48 +498,63 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 			else {
 				index_lookup[hash] = index_pos;
 				index[index_pos] = px;
-				index_pos = (index_pos + 1) % 64;
+				index_pos = (index_pos + 1) & 63;
 
-				if (px.rgba.a == px_prev.rgba.a) {
-					signed char vr = px.rgba.r - px_prev.rgba.r;
-					signed char vg = px.rgba.g - px_prev.rgba.g;
-					signed char vb = px.rgba.b - px_prev.rgba.b;
+				if (px.rgba.a != px_prev.rgba.a) {
+					bytes[p++] = QOI_OP_A;
+					bytes[p++] = px.rgba.a;
+				}
 
-					signed char vg_r = vr - vg;
-					signed char vg_b = vb - vg;
+				signed char vg   = px.rgba.g - px_prev.rgba.g;
+				signed char vg_r = px.rgba.r - px_prev.rgba.r - vg;
+				signed char vg_b = px.rgba.b - px_prev.rgba.b - vg;
 
-					if (
-						vr > -3 && vr < 2 &&
-						vg > -3 && vg < 2 &&
-						vb > -3 && vb < 2
-					) {
-						bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
-					}
-					else if (
-						vg_r >  -9 && vg_r <  8 &&
-						vg   > -33 && vg   < 32 &&
-						vg_b >  -9 && vg_b <  8
-					) {
-						bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
-						bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
-					}
-					else {
-						bytes[p++] = QOI_OP_RGB;
-						bytes[p++] = px.rgba.r;
-						bytes[p++] = px.rgba.g;
-						bytes[p++] = px.rgba.b;
-					}
+				if (
+					vg   >= -4 && vg   <  0 &&
+					vg_r >= -1 && vg_r <= 2 &&
+					vg_b >= -1 && vg_b <= 2
+				) {
+					bytes[p++] = QOI_OP_LUMA | (vg + 4) << 4 | (vg_r + 1) << 2 | (vg_b + 1);
+				}
+				else if (
+					vg   >=  0 && vg   <= 3 &&
+					vg_r >= -2 && vg_r <= 1 &&
+					vg_b >= -2 && vg_b <= 1
+				) {
+					bytes[p++] = QOI_OP_LUMA | (vg + 4) << 4 | (vg_r + 2) << 2 | (vg_b + 2);
+				}
+				else if (
+					px.rgba.g == px.rgba.r &&
+					px.rgba.g == px.rgba.b
+				) {
+					bytes[p++] = QOI_OP_GRAY;
+					bytes[p++] = px.rgba.g;					
+				}
+				else if (
+					vg_r >=  -8 && vg_r <=  7 &&
+					vg   >= -16 && vg   <= 15 &&
+					vg_b >=  -8 && vg_b <=  7
+				) {
+					bytes[p++] = QOI_OP_LUMA2    | (vg   + 16);
+					bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+				}
+				else if (
+					vg_r >= -32 && vg_r <= 31 &&
+					vg_b >= -32 && vg_b <= 31
+				) {
+					bytes[p++] = QOI_OP_LUMA3           | ((vg_r + 32) >> 2);
+					bytes[p++] = ((vg_r + 32) & 3) << 6 |  (vg_b + 32);
+					bytes[p++] = vg + 128;
 				}
 				else {
-					bytes[p++] = QOI_OP_RGBA;
+					bytes[p++] = QOI_OP_RGB;
 					bytes[p++] = px.rgba.r;
 					bytes[p++] = px.rgba.g;
 					bytes[p++] = px.rgba.b;
-					bytes[p++] = px.rgba.a;
 				}
 			}
+			px_prev = px;
 		}
-		px_prev = px;
 	}
 
 	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
@@ -547,45 +618,69 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	px.rgba.a = 255;
 
 	chunks_len = size - (int)sizeof(qoi_padding);
-	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+	for (px_pos = 0; px_pos < px_len;) {
 		if (run > 0) {
 			run--;
 		}
 		else if (p < chunks_len) {
 			int b1 = bytes[p++];
-
-			if (b1 == QOI_OP_RGB) {
-				px.rgba.r = bytes[p++];
-				px.rgba.g = bytes[p++];
-				px.rgba.b = bytes[p++];
-				index[index_pos++ % 64] = px;
+			if (b1 < 0x80) {  		/* QOI_OP_LUMA */
+				int vg = ((b1 >> 4) & 7) - 4;
+				px.rgba.g += vg;
+				if (vg < 0) {
+					px.rgba.r += vg - 1 + ((b1 >> 2) & 3);
+					px.rgba.b += vg - 1 +  (b1 &  3);
+				}
+				else {
+					px.rgba.r += vg - 2 + ((b1 >> 2) & 3);
+					px.rgba.b += vg - 2 +  (b1 &  3);
+				}
+				index[index_pos++ & 63] = px;
 			}
-			else if (b1 == QOI_OP_RGBA) {
-				px.rgba.r = bytes[p++];
-				px.rgba.g = bytes[p++];
-				px.rgba.b = bytes[p++];
-				px.rgba.a = bytes[p++];
-				index[index_pos++ % 64] = px;
+			else if (b1 < 0xc0) {		/* QOI_OP_INDEX */
+				px = index[b1 & 63];
 			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
-				px = index[b1];
-			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
-				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
-				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
-				px.rgba.b += ( b1       & 0x03) - 2;
-				index[index_pos++ % 64] = px;
-			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
+			else if (b1 < 0xe0) {		/* QOI_OP_LUMA2 */
 				int b2 = bytes[p++];
-				int vg = (b1 & 0x3f) - 32;
+				int vg = (b1 & 0x1f) - 16;
 				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
 				px.rgba.g += vg;
 				px.rgba.b += vg - 8 +  (b2       & 0x0f);
-				index[index_pos++ % 64] = px;
+				index[index_pos++ & 63] = px;
 			}
-			else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
-				run = (b1 & 0x3f);
+			else if (b1 < 0xf0) {		/* QOI_OP_LUMA3 */
+				int b2 = bytes[p++];
+				int vg = bytes[p++] - 128;
+				px.rgba.r += vg - 32 + (((b1 & 0x0f) << 2) | ((b2 >> 6) & 3));
+				px.rgba.g += vg;
+				px.rgba.b += vg - 32 +   (b2 & 0x3f);
+				index[index_pos++ & 63] = px;
+			}
+			else if (b1 < 0xf8) {		/* QOI_OP_RUN */
+				run = b1 & 7;
+			}
+			else if (b1 < 0xfc) {		/* QOI_OP_RUN2 */
+				run = ((b1 & 3) << 8) | bytes[p++];
+			}
+			else if (b1 == QOI_OP_GRAY) {
+				int vg = bytes[p++];
+				px.rgba.r = vg;
+				px.rgba.g = vg;
+				px.rgba.b = vg;
+				index[index_pos++ & 63] = px;
+			}
+			else if (b1 == QOI_OP_RGB) {
+				px.rgba.r = bytes[p++];
+				px.rgba.g = bytes[p++];
+				px.rgba.b = bytes[p++];
+				index[index_pos++ & 63] = px;
+			}
+			else if (b1 == QOI_OP_A) {
+				px.rgba.a = bytes[p++];
+				continue;
+			}
+			else {				/* QOI_OP_END */
+				break;
 			}
 		}
 
@@ -596,6 +691,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		if (channels == 4) {
 			pixels[px_pos + 3] = px.rgba.a;
 		}
+ 		px_pos += channels;
 	}
 
 	return pixels;
